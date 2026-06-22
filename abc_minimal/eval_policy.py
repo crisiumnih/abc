@@ -852,6 +852,10 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                     if config.vanilla_physics
                     else env.render_cameras
                 )
+                state_fn = env.get_state_vanilla if config.vanilla_physics else env.get_state
+                traj_states: list[np.ndarray] = []
+                traj_actions: list[np.ndarray] = []
+                traj_bottles: list[int] = []  # per-step GT bottle count, aligned to traj_states (pre-action)
                 noise = sample_noise(rng)
                 t_infer = time.perf_counter()
                 actions = policy.infer(obs, noise=noise)
@@ -892,6 +896,11 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                             next_noise = sample_noise(rng)
                             rtc.start(next_obs, actions, next_noise)
                             rtc_started = True
+                        traj_states.append(np.asarray(state_fn(), dtype=np.float32))
+                        traj_actions.append(np.asarray(action, dtype=np.float32))
+                        # GT bottle count for this (pre-action) state: final_eval holds the
+                        # post-previous-step = pre-current-step evaluation -> aligns with state[t].
+                        traj_bottles.append(int(final_eval["num_bottles_in_bin"]))
                         step_fn(action)
                         final_eval = eval_fn()
                         steps += 1
@@ -950,6 +959,32 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                 if video is not None:
                     video.close()
 
+            # Save the executed (state, action) trajectory in the ABC (T, 28) layout
+            # (14 proprio state + 14 action), float64 to match states_actions.bin.
+            sa_path = out_dir / f"world_{world_index:03d}_states_actions.npy"
+            bottles_path = out_dir / f"world_{world_index:03d}_bottles.npy"
+            meta_path = out_dir / f"world_{world_index:03d}_meta.json"
+            if traj_states and traj_actions:
+                states_arr = np.stack(traj_states).astype(np.float64)
+                actions_arr = np.stack(traj_actions).astype(np.float64)
+                states_actions = np.concatenate([states_arr, actions_arr], axis=1)
+                np.save(sa_path, states_actions)
+                # per-step GT bottle count (T,), row-aligned to states_actions -> per-chunk GT progress
+                np.save(bottles_path, np.asarray(traj_bottles, dtype=np.int16))
+                # self-describing sidecar: persist the SEED + GT so re-bucketing never drops it again
+                meta_path.write_text(json.dumps(jsonable({
+                    "world_index": world_index,
+                    "world_seed": seed,
+                    "base_seed": config.seed,
+                    "success": bool(final_eval["ever_success"]),
+                    "max_bottles": int(final_eval["max_bottles_in_bin_so_far"]),
+                    "num_active_bottles": int(final_eval["num_active_bottles"]),
+                    "steps": steps,
+                    "states_actions_path": str(sa_path),
+                    "bottles_path": str(bottles_path),
+                    "randomization": env.randomization,
+                }), indent=2))
+
             world = {
                 "world_index": world_index,
                 "world_seed": seed,
@@ -962,6 +997,10 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                 "randomization": env.randomization,
                 "final_task_eval": final_eval,
                 "video_path": str(video_path) if video_path is not None else None,
+                "states_actions_path": str(sa_path) if (traj_states and traj_actions) else None,
+                "states_actions_shape": list(states_actions.shape) if (traj_states and traj_actions) else None,
+                "bottles_path": str(bottles_path) if (traj_states and traj_actions) else None,
+                "meta_path": str(meta_path) if (traj_states and traj_actions) else None,
             }
             worlds.append(world)
             print(

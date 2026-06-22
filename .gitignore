@@ -6,3 +6,6 @@ cache/
 uv.lock
 checkpoints/
 outputs/
+
+# local sim log
+MUJOCO_LOG.TXT
