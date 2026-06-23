@@ -192,6 +192,12 @@ class SimEvalConfig:
     video_every_n_actions: int = 1
     prompt: str = "sim put the plastic bottles in the bin"
 
+    # QGF test-time guidance (eager only; forces fast_inference off when active).
+    qgf_critic: str | None = None      # path to saved critic_qgf.pt
+    qgf_weight: float = 0.0            # 1/beta guidance weight
+    qgf_window: str = "off"            # off | early | early_mid | full  (scope by step/max_steps)
+    qgf_mode: str = "qgf"             # qgf (grad@clean est) | qfql (grad@noisy action; mechanism control)
+
     scene: PutBottlesSimConfig = field(default_factory=PutBottlesSimConfig)
     clip: ClipConfig = field(default_factory=ClipConfig)
     model: DiTConfig = field(default_factory=DiTConfig)

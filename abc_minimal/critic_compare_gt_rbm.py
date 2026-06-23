@@ -33,8 +33,23 @@ import torch
 
 from abc_minimal.critic_train import (
     return_to_go, standardize_fit, std_actions_fit, train_one,
-    pearson, auc, action_ranking, episode_split,
+    pearson, auc, action_ranking,
 )
+
+
+def episode_split_generic(ep, bucket, seed=0, frac=(0.7, 0.15, 0.15)):
+    """Split BY EPISODE, stratified by bucket (good/bad/mid). Returns {episode_id: split}."""
+    rng = np.random.default_rng(seed)
+    bucket_by_ep = {int(e): int(bucket[ep == e][0]) for e in np.unique(ep)}
+    assign = {}
+    for b in sorted(set(bucket_by_ep.values())):
+        ids = [e for e in bucket_by_ep if bucket_by_ep[e] == b]
+        rng.shuffle(ids)
+        n = len(ids); ntr = int(round(frac[0] * n)); nva = int(round(frac[1] * n))
+        for e in ids[:ntr]: assign[e] = "train"
+        for e in ids[ntr:ntr + nva]: assign[e] = "val"
+        for e in ids[ntr + nva:]: assign[e] = "test"
+    return assign
 
 SCR = "/data/tmp/claude-1000/-data2-experiemnts/e13cbe9d-be59-4b9a-8186-693ee5df9bb7/scratchpad"
 HBINS = lambda hor: {"early(<0.3)": hor < 0.3, "mid(0.3-0.7)": (hor >= 0.3) & (hor < 0.7), "late(>=0.7)": hor >= 0.7}
@@ -81,7 +96,8 @@ def evaluate_source(name, reward, feats, s_pca, tr, va, te, ep, cidx, hor, bucke
                 hm = np.ones(len(hor), bool) if h == "ALL" else hbins[h]
                 it = np.ones(te.sum(), bool) if h == "ALL" else hm[te]
                 out[m][h]["corr"].append(pearson(pred[it], tgt[te & hm]))
-                out[m][h]["auc"].append(auc(pred[it], bucket[te & hm]))
+                bte = bucket[te & hm]; keep = (bte == 0) | (bte == 1)  # AUC: good/bad only, drop mid
+                out[m][h]["auc"].append(auc(pred[it][keep], bte[keep]))
                 r, _ = action_ranking(pred[it], G_te[it], s_pca_te[it], ep_te[it])
                 out[m][h]["rank"].append(r)
     agg = lambda l: float(np.nanmean(l)) if np.any(np.isfinite(l)) else float("nan")
@@ -115,8 +131,11 @@ def main():
     a_flat = a_chunk.reshape(len(s), -1); m_flat = np.repeat(mk, a_chunk.shape[2], 1)
     cidx, hor, ep, bucket = d["chunk_idx"], d["horizon_frac"], d["episode_id"], d["bucket"]
 
-    split = episode_split(args.split_seed); where = np.array([split[e] for e in ep])
+    split = episode_split_generic(ep, bucket, args.split_seed)
+    where = np.array([split[int(e)] for e in ep])
     tr, va, te = where == "train", where == "val", where == "test"
+    print(f"episodes: train={len(set(ep[tr]))} val={len(set(ep[va]))} test={len(set(ep[te]))}  "
+          f"rows: {tr.sum()}/{va.sum()}/{te.sum()}")
     feats, s_pca = build_feats(s, a_flat, m_flat, cidx, tr, args.pca)
 
     res = {}
@@ -136,12 +155,13 @@ def main():
             rb = res["rbm"]["Q(s,a)"][h][metric]; gt = res["gt"]["Q(s,a)"][h][metric]
             print(f"{h:<16}{rb:>10.3f}{gt:>10.3f}{gt-rb:>+12.3f}")
 
-    # full per-model tables too
-    for src in ("rbm", "gt"):
-        print(f"\n[{src}] action-ranking by model x horizon:")
-        print(f"{'model':<15}" + "".join(f"{h:>16}" for h in horder))
-        for m in feats:
-            print(f"{m:<15}" + "".join(f"{res[src][m][h]['rank']:>16.3f}" for h in horder))
+    # full per-model tables too (action-ranking + corr) -> shows Q(s,a) vs baselines
+    for metric in ("rank", "corr"):
+        for src in ("rbm", "gt"):
+            print(f"\n[{src}] {metric} by model x horizon:")
+            print(f"{'model':<15}" + "".join(f"{h:>16}" for h in horder))
+            for m in feats:
+                print(f"{m:<15}" + "".join(f"{res[src][m][h][metric]:>16.3f}" for h in horder))
 
     # headline verdict: does GT lift MID action-ranking above 0.5 and beat baselines?
     mid = "mid(0.3-0.7)"

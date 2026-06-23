@@ -812,10 +812,20 @@ class DiTPolicy(nn.Module):
         return F.mse_loss(u_t, v_t)
 
     @torch.no_grad()
-    def sample_actions(self, batch, num_steps=10, noise=None):
+    def sample_actions(self, batch, num_steps=10, noise=None,
+                       guidance=None, guidance_weight=0.0, guidance_mode="qgf"):
         """Euler flow integration from noise to actions (production tau=1 path).
         Vision tokens and the static conditioning are computed once and reused
-        across steps, like production infer()."""
+        across steps, like production infer().
+
+        Guidance (eager only; requires fast_inference=False so autograd works). At each
+        denoising step we evaluate g = grad_{a_eval} Q(s, a_eval) through the critic only:
+          guidance_mode="qgf"  -> a_eval = clean-action estimate a1 = x_t - t*v  (v stop-grad)
+                                  (ABC flow runs t:1->0, v=noise-actions, so a1 = x_t - t*v)
+          guidance_mode="qfql" -> a_eval = x_t (the NOISY action; mechanism control, OOD for Q)
+        ABC integrates with dt<0, so the guidance term is SUBTRACTED -> positive guidance_weight
+        (=1/beta) INCREASES Q (sign-verified). The per-step dQ diagnostic always uses the clean
+        estimate (v vs v-gterm) so it is comparable across modes."""
         state = batch["state"]
         B = state.shape[0]
         model_dtype = self.y_embedder.weight.dtype
@@ -829,11 +839,28 @@ class DiTPolicy(nn.Module):
             )
         x_t = noise.to(device=state.device, dtype=model_dtype)
         vision_tokens = self.build_vision_tokens(batch["images"])
+        guided = guidance is not None and guidance_weight != 0.0
+        s_pooled = vision_tokens.mean(dim=1).float() if guided else None  # critic state s
         dt = -1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((B,), 1.0 + i * dt, device=state.device, dtype=model_dtype)
             c = self.compute_cond(state, batch["task_vec_clip"], t)
             v = self.predict_velocity(x_t, c, vision_tokens)
+            if guided:
+                a_clean = (x_t - t.view(B, 1, 1) * v).detach().float()      # clean-action estimate
+                a_eval = x_t.detach().float() if guidance_mode == "qfql" else a_clean
+                g, _ = guidance.grad(s_pooled, a_eval)                       # qgf: grad@clean; qfql: grad@noisy
+                g = g.to(v.dtype)
+                if torch.isfinite(g).all():
+                    gterm = guidance_weight * g
+                    diag = getattr(self, "_qgf_diag", None)
+                    if diag is not None:  # per-step logging: |gterm| vs |v|, and dQ (clean est, both modes)
+                        q_bc = guidance.q(s_pooled, a_clean)
+                        q_g = guidance.q(s_pooled, (x_t - t.view(B, 1, 1) * (v - gterm)).detach().float())
+                        diag["v_norm"].append(float(v.norm(dim=(-2, -1)).mean()))
+                        diag["g_norm"].append(float(gterm.norm(dim=(-2, -1)).mean()))
+                        diag["dq"].append(float((q_g - q_bc).mean()))
+                    v = v - gterm  # minus: dt<0 so +weight increases Q
             x_t = x_t + v * dt
         return x_t
 

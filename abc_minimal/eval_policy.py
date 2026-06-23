@@ -603,6 +603,26 @@ class SimPolicy:
         self.task_vec = self.embedder.encode([config.prompt]).to(self.device)
         self._fast_graph: FastInferenceGraph | None = None
         self._fast_rtc_graphs: dict[int, FastRTCInferenceGraph] = {}
+        # QGF guidance (eager). When active, fast inference is disabled so autograd works.
+        self.guidance = None
+        self.qgf_weight = float(config.qgf_weight)
+        self.qgf_window = config.qgf_window
+        self.qgf_mode = config.qgf_mode
+        self.max_steps = config.num_chunks * config.execute_chunk_dim
+        if config.qgf_critic and config.qgf_window != "off":
+            from abc_minimal.critic_qgf import QGFGuidance
+            self.guidance = QGFGuidance(config.qgf_critic, self.device)
+            print(f"QGF guidance ON: critic={config.qgf_critic} weight={self.qgf_weight} "
+                  f"window={self.qgf_window} max_steps={self.max_steps}", flush=True)
+
+    def qgf_weight_for_step(self, step: int) -> float:
+        if self.guidance is None:
+            return 0.0
+        frac = step / max(self.max_steps, 1)
+        active = (self.qgf_window == "full"
+                  or (self.qgf_window == "early" and frac < 0.3)
+                  or (self.qgf_window == "early_mid" and frac < 0.7))
+        return self.qgf_weight if active else 0.0
 
     def enable_fast_inference(
         self,
@@ -697,6 +717,7 @@ class SimPolicy:
         noise: np.ndarray | None = None,
         action_prefix: np.ndarray | None = None,
         prefix_length: int = 0,
+        guidance_weight: float | None = None,
     ) -> np.ndarray:
         if action_prefix is None and self._fast_graph is not None:
             return self._fast_graph.infer(obs, noise)
@@ -718,7 +739,11 @@ class SimPolicy:
         if noise is not None:
             noise_t = torch.from_numpy(noise[None].astype(np.float32)).to(self.device)
         if action_prefix is None:
-            actions = self.model.sample_actions(batch, num_steps=self.diffusion_steps, noise=noise_t)
+            gw = self.qgf_weight if guidance_weight is None else guidance_weight
+            actions = self.model.sample_actions(
+                batch, num_steps=self.diffusion_steps, noise=noise_t,
+                guidance=self.guidance, guidance_weight=(gw if self.guidance is not None else 0.0),
+                guidance_mode=self.qgf_mode)
         else:
             prefix_t = torch.from_numpy(
                 self.normalized_action_prefix(action_prefix, prefix_length)[None]
@@ -789,6 +814,8 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     if config_errors:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(config_errors))
 
+    if config.qgf_window != "off" and config.rtc:
+        raise ValueError("QGF guidance + RTC not supported together (use plain eager rollout).")
     require_mjwarp()
     ckpt_path = local_checkpoint(config.checkpoint)
     device = resolve_device(config.device)
@@ -818,7 +845,9 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             t0 = time.perf_counter()
             seed = int(config.seed + world_index)
             obs = env.reset(seed=seed)
-            if config.fast_inference and not fast_inference_ready:
+            if policy.guidance is not None:  # reset per-world QGF diagnostics
+                policy.model._qgf_diag = {"v_norm": [], "g_norm": [], "dq": []}
+            if config.fast_inference and config.qgf_window == "off" and not fast_inference_ready:
                 warmup_rng = np.random.default_rng(config.policy_seed)
                 warmup_noise = sample_noise(warmup_rng)
                 t_fast = time.perf_counter()
@@ -858,7 +887,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                 traj_bottles: list[int] = []  # per-step GT bottle count, aligned to traj_states (pre-action)
                 noise = sample_noise(rng)
                 t_infer = time.perf_counter()
-                actions = policy.infer(obs, noise=noise)
+                actions = policy.infer(obs, noise=noise, guidance_weight=policy.qgf_weight_for_step(steps))
                 current_infer_s = time.perf_counter() - t_infer
                 if config.rtc:
                     rtc_warmup_rng = np.random.default_rng(config.policy_seed)
@@ -917,7 +946,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                         rtc_obs_s = time.perf_counter() - t_obs
                         noise = sample_noise(rng)
                         t_infer = time.perf_counter()
-                        actions = policy.infer(obs, noise=noise)
+                        actions = policy.infer(obs, noise=noise, guidance_weight=policy.qgf_weight_for_step(steps))
                         current_infer_s = time.perf_counter() - t_infer
                     elif rtc_started:
                         actions, rtc_infer_s, rtc_ready = rtc.get()
@@ -985,9 +1014,22 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                     "randomization": env.randomization,
                 }), indent=2))
 
+            qdiag = getattr(policy.model, "_qgf_diag", None)
+            qgf_summary = None
+            if qdiag and qdiag["v_norm"]:
+                vmean = float(np.mean(qdiag["v_norm"])); gmean = float(np.mean(qdiag["g_norm"]))
+                qgf_summary = {
+                    "n_steps": len(qdiag["v_norm"]),
+                    "mean_v_norm": vmean, "mean_g_norm": gmean,
+                    "mean_g_over_v": (gmean / vmean if vmean > 0 else None),
+                    "mean_dQ": float(np.mean(qdiag["dq"])),
+                }
+                print(f"world={world_index:03d} qgf: |g|/|v|={qgf_summary['mean_g_over_v']:.3f} "
+                      f"mean_dQ={qgf_summary['mean_dQ']:+.4f} (n_steps={qgf_summary['n_steps']})", flush=True)
             world = {
                 "world_index": world_index,
                 "world_seed": seed,
+                "qgf_diag": qgf_summary,
                 "success": bool(final_eval["ever_success"]),
                 "final_success": bool(final_eval["success"]),
                 "reward": float(final_eval["reward"]),
